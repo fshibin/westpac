@@ -1,0 +1,971 @@
+  import sailpoint.object.Application;
+  import sailpoint.object.AttributeDefinition;
+  import sailpoint.object.AuditEvent;
+  import sailpoint.object.Bundle;
+  import sailpoint.object.BundleArchive;
+  import sailpoint.object.Configuration;
+  import sailpoint.object.EmailTemplate;
+  import sailpoint.object.EmailOptions;
+  import sailpoint.object.EmailFileAttachment;
+  import sailpoint.object.Identity;
+  import sailpoint.object.Identity.WorkgroupNotificationOption;
+  import sailpoint.object.Filter;
+  import sailpoint.object.ManagedAttribute;
+  import sailpoint.object.QueryOptions;
+  import sailpoint.object.Profile;
+  import sailpoint.object.Schema;
+  import sailpoint.object.WorkflowCase;
+  import sailpoint.object.WorkItem;
+  import sailpoint.tools.Message;
+  import sailpoint.tools.RFC4180LineParser;
+  import sailpoint.tools.Util;
+  import sailpoint.api.RoleLifecycler;
+  import sailpoint.server.Auditor;
+
+  import java.io.File;
+  import java.io.BufferedReader;
+  import java.io.FileReader;
+  import java.util.ArrayList;
+  import java.util.Calendar;
+  import java.util.Date;
+  import java.util.List;
+  import java.util.HashMap;
+  import java.util.HashSet;
+  import java.util.Iterator;
+  import java.util.Map;
+  import java.util.Set;
+  import java.text.SimpleDateFormat;
+  
+  import org.apache.log4j.Logger;
+  import org.apache.log4j.Level;
+
+
+  String CONST_LINE_NO = "line no";
+  String CONST_OPTIONAL_ROLE = "optional role";
+  String CONST_ROLE_OWNER = "role owner";
+  String CONST_APPLICATION = "application";
+  String CONST_ATTRIBUTE = "attribute";
+  String CONST_ENTITLEMENT = "entitlement";
+  String CONST_ACTION = "action";
+  String CONST_APPROVAL_REQUIRED = "approval required";
+  String CONST_REQUESTOR = "requestor";
+  String CONST_BUSINESS_JUSTIFICATION = "business justification";
+  
+  String CONST_OPTIONAL_ROLE_TYPE = "Application Role";
+  String CONST_OPTIONAL_ROLE_CONTAINER_NAME = "Optional Roles";
+  
+
+  // add global counters to record number of processed etc.
+  int cntrEntitlementAdded = 0;
+  int cntrEntitlementDeleted = 0;
+  int cntrEntitlementSkipped = 0;
+  int cntrEntitlementProcessed = 0;
+  
+  Set processedRoles = new HashSet();
+
+  Map optionalRolesToNotify = new HashMap();
+  
+  
+  public List getEntitlements(String appName, String attribute, String entitlement) {
+    List entitlementList = new ArrayList();
+
+    QueryOptions qo = new QueryOptions();
+    qo.addFilter(Filter.eq("application.name", appName));
+    qo.addFilter(Filter.eq("attribute", attribute));
+
+    // cater for AD entitlements with no display name
+    List filters = new ArrayList();
+    filters.add(Filter.eq("displayName", entitlement));
+    filters.add(Filter.eq("value", entitlement));
+    filters.add(Filter.like("value", "cn=" + entitlement + ",", Filter.MatchMode.START)); 
+
+    Filter filterEntitlement = Filter.or(filters);
+    qo.addFilter(filterEntitlement);
+
+    List mas = context.getObjects(ManagedAttribute.class, qo);
+    if(null != mas &amp;&amp; !mas.isEmpty()) {
+      entitlementList.add(mas.get(0).getValue());
+    }
+    else {
+      entitlementList.add(entitlement);
+    }
+
+    return entitlementList;
+  }
+
+  public String getAttributeNameInSchema(Application app, String attrName) {
+    String retName = null;
+
+    Schema acctSchema = app.getAccountSchema();
+    AttributeDefinition attrDefn = acctSchema.getAttributeDefinition(attrName);
+    if(null == attrDefn) {
+      List schemaAttrNameList = acctSchema.getAttributeNames();
+      if(null != schemaAttrNameList &amp;&amp; !schemaAttrNameList.isEmpty()) {
+        String schemaAttrName = null;
+        for(String n : schemaAttrNameList) {
+          if(n.equalsIgnoreCase(attrName)) {
+            // found it
+            retName = n;
+            break;
+          }
+        }
+      }
+    }
+    
+    if(null == retName) {
+      retName = attrName;
+    }
+
+    return retName;
+  }
+
+  public boolean isAttributeMultiValued(Application app, String attrName) {
+    boolean isMultiValued = false;
+
+    Schema acctSchema = app.getAccountSchema();
+    AttributeDefinition attrDefn = acctSchema.getAttributeDefinition(attrName);
+    if(null != attrDefn &amp;&amp; attrDefn.isMulti()) {
+      isMultiValued = true;
+    }
+
+    return isMultiValued;
+  }
+
+  public boolean isEntitlementExistInRole(Bundle itRole, String appName, String attrName, List entitlementList) {
+    boolean isEntitlementExist = false;
+
+    if(null == itRole) {
+      // if it was create new IT role, this will be null, 
+      // and of course entitlement does not exist
+      return isEntitlementExist;
+    }
+    
+    Filter profileFilterContains = Filter.containsAll(attrName, entitlementList);
+    String filterContainsExpression = profileFilterContains.getExpression();
+
+    Filter profileFilterEq = Filter.eq(attrName, entitlementList.get(0));
+    String filterEqExpression = profileFilterEq.getExpression();
+
+    List profiles = new ArrayList();
+    if(itRole.getProfiles() != null) {
+      profiles = itRole.getProfiles();
+
+      // go through existing profiles, add those NOT equals to the specified one to the new profile list
+      List newProfiles = new ArrayList();
+      for (Profile prof : profiles) {
+        Application profApp = prof.getApplication();
+        if(null == profApp || !profApp.getName().equalsIgnoreCase(appName)) {
+          continue;
+        }
+        
+        List constraints = prof.getConstraints();
+        for (Filter filterToCompare : constraints) {
+          String filterExp = filterToCompare.getExpression();
+
+          if(filterContainsExpression.equalsIgnoreCase(filterExp) ||
+             filterEqExpression.equalsIgnoreCase(filterExp) ) {
+            isEntitlementExist = true;
+            break;
+          }
+        }
+        
+        if(isEntitlementExist) break;
+      }
+    }
+    logger.debug("isEntitlementExist: " + isEntitlementExist);
+
+    return isEntitlementExist;
+  }
+
+  public boolean addEntitlement(Bundle itRole, Application app, String attrName, List entitlementList) {
+    boolean isUpdateRequired = true;
+    String appName = app.getName();
+
+    // get the proper name defined in app schema
+    String attrSchemaName = getAttributeNameInSchema(app, attrName);
+
+    // check the attribute and see if it is multi-value?
+    // define the filter type
+    Filter profileFilter = null;
+    if(isAttributeMultiValued(app, attrSchemaName)) {
+      logger.debug("attrName: " + attrSchemaName + " is multi-value");
+      profileFilter = Filter.containsAll(attrSchemaName, entitlementList);
+    }
+    else {
+      logger.debug("attrName: " + attrSchemaName + " is NOT multi-value");
+      profileFilter = Filter.eq(attrSchemaName, entitlementList.get(0));
+    }
+
+    Profile newProf = new Profile();
+    newProf.addConstraint(profileFilter);
+    newProf.setApplication(app);
+
+    List profiles = new ArrayList();
+    if(null != itRole.getProfiles()) {
+      profiles = itRole.getProfiles();
+
+      // check if profile/entitlement already exists?
+      String filterExpression = profileFilter.getExpression();
+      for (Profile prof : profiles) {
+        Application profApp = prof.getApplication();
+        if(null == profApp || !profApp.getName().equalsIgnoreCase(appName)) {
+          continue;
+        }
+      
+        List constraints = prof.getConstraints();
+        for (Filter filterToCompare : constraints) {
+          String filterExp = filterToCompare.getExpression();
+
+          if(filterExpression.equalsIgnoreCase(filterExp)) {
+            isUpdateRequired = false;
+            logger.debug("addEntitlement, found entitlement in role!");
+            break;
+          }
+        }
+      }
+    }
+
+    if(isUpdateRequired) {
+      String itRoleName = itRole.getName();
+
+      //Take entitlementValue out of entitlementList
+      String entitlementValue = entitlementList.get(0);
+      entitlementValue = entitlementValue.startsWith("CN=") || entitlementValue.startsWith("cn=") ? entitlementValue.substring((entitlementValue.indexOf('=') + 1), entitlementValue.indexOf(',')) : entitlementValue;
+
+      //The Profile Name naming convention is IT Role Name:Application Name:Entitlement Attribute Name:Entitlement Value
+      //newProf.setName(itRoleName + ":" + app.getName() + ":" + attrSchemaName + ":" + entitlementValue);
+      
+      String profileName = attrSchemaName + ":" + entitlementValue;
+      if(profileName.length() > 128) {
+        profileName = profileName.substring(0, 127);
+        logger.warn("IT role '" + businessRoleName + " " + profile.getApplication().getName() + 
+          "' profile name exceeded 128 length. Profile name truncated as '" + profileName + "'");
+      }
+      newProf.setName(profileName);
+      
+      profiles.add(newProf);
+      itRole.assignProfiles(profiles);
+    }
+
+    return isUpdateRequired;
+  }
+
+  public boolean deleteEntitlement(Bundle itRole, String appName, String attrName, List entitlementList) {
+    boolean isUpdateRequired = false;
+
+    Filter profileFilterContains = Filter.containsAll(attrName, entitlementList);
+    String filterContainsExpression = profileFilterContains.getExpression();
+
+    Filter profileFilterEq = Filter.eq(attrName, entitlementList.get(0));
+    String filterEqExpression = profileFilterEq.getExpression();
+
+    List profiles = new ArrayList();
+    if(itRole.getProfiles() != null) {
+      profiles = itRole.getProfiles();
+
+      // go through existing profiles, add those NOT equals to the specified one to the new profile list
+      List newProfiles = new ArrayList();
+      for (Profile prof : profiles) {
+        // check if it is the same application
+        Application profApp = prof.getApplication();
+        if(null == profApp || !profApp.getName().equalsIgnoreCase(appName)) {
+          newProfiles.add(prof);
+          continue;
+        }
+        
+        List constraints = prof.getConstraints();
+        for (Filter filterToCompare : constraints) {
+          String filterExp = filterToCompare.getExpression();
+
+          if(!filterContainsExpression.equalsIgnoreCase(filterExp) &amp;&amp;
+             !filterEqExpression.equalsIgnoreCase(filterExp) ) {
+            newProfiles.add(prof);
+          }
+          else {
+            isUpdateRequired = true;
+            logger.debug("deleteEntitlement, found entitlement in role!");
+          }
+        }
+      }
+
+      itRole.assignProfiles(newProfiles);
+    }
+
+    return isUpdateRequired;
+  }
+
+  public Bundle createOptionalRole(String optionalRoleName, String roleOwner, Application application) {
+    Bundle optionalRole = new sailpoint.object.Bundle();
+
+    optionalRole.setName(optionalRoleName);
+    optionalRole.setDisplayName(optionalRoleName);
+    optionalRole.setType(CONST_OPTIONAL_ROLE_TYPE);
+
+    // set it to inherit optional roles container
+    Bundle optionalRoleContainer = (Bundle)context.getObjectByName(Bundle.class, CONST_OPTIONAL_ROLE_CONTAINER_NAME);
+    if (optionalRoleContainer != null) {
+      List b = new ArrayList();
+      b.add(optionalRoleContainer);
+      optionalRole.setInheritance(b);
+    }
+    
+    Identity ownerId = (Identity)context.getObject(Identity.class, roleOwner);
+    if(ownerId == null) {
+      ownerId = context.getObject(Identity.class, "ISG Administrator Group");
+    }
+    optionalRole.setOwner(ownerId);
+
+    return optionalRole;
+  }
+
+  public BundleArchive createRoleArchive(Bundle role, String requester) {
+    RoleLifecycler roleLifecycler = new RoleLifecycler(context);
+    int newVersion = 1;
+
+    // find last version, then +1
+    BundleArchive prvArchive = roleLifecycler.getPreviousVersion(role);
+    if(null != prvArchive) {
+      newVersion = prvArchive.getVersion() + 1;
+    }
+
+    BundleArchive archive = new BundleArchive(role);
+    archive.setVersion(newVersion);
+    archive.setCreator(requester);
+
+    return archive;
+  }
+  
+  public int getWorkItemID(WorkflowCase workflowCase) {
+    int workItemId = -1;
+    
+    if(null == workflowCase) {
+      return -1;
+    }
+    
+    String wfcId = workflowCase.getId();
+    
+    QueryOptions qo = new QueryOptions();
+    qo.addFilter(Filter.eq("workflowCase.id", wfcId));
+
+    Iterator itr = context.search(WorkItem.class, qo);
+    if(null != itr &amp;&amp; itr.hasNext()) {
+      WorkItem wi = (WorkItem)itr.next();
+      String wiId = wi.getName();
+      workItemId = Integer.parseInt(wiId);
+    }
+    
+    return workItemId;
+  }
+
+  public boolean processLineHash(Map lineHash, List errorList, BufferedWriter skipRptWriter, String inputFilename, Date timestamp) {
+    // get the line number from the lineHash which came 
+    // from the sorted file with the original line number
+    int lineCounter = Integer.parseInt(lineHash.get(CONST_LINE_NO));
+    
+    String optionalRoleName = lineHash.get(CONST_OPTIONAL_ROLE);
+    String roleOwnerName = lineHash.get(CONST_ROLE_OWNER);
+    String appName = lineHash.get(CONST_APPLICATION);
+    String attributeName = lineHash.get(CONST_ATTRIBUTE);
+    String entitlementValue = lineHash.get(CONST_ENTITLEMENT);
+    String action = lineHash.get(CONST_ACTION);
+    String approvalRequired = lineHash.get(CONST_APPROVAL_REQUIRED);
+    String requestor = lineHash.get(CONST_REQUESTOR);
+    String justification = lineHash.get(CONST_BUSINESS_JUSTIFICATION);
+
+    if(Util.isNullOrEmpty(optionalRoleName) &amp;&amp;
+       Util.isNullOrEmpty(roleOwnerName) &amp;&amp;
+       Util.isNullOrEmpty(appName) &amp;&amp;
+       Util.isNullOrEmpty(attributeName) &amp;&amp;
+       Util.isNullOrEmpty(entitlementValue) &amp;&amp;
+       Util.isNullOrEmpty(action) &amp;&amp;
+       Util.isNullOrEmpty(approvalRequired) &amp;&amp;
+       Util.isNullOrEmpty(requestor) &amp;&amp;
+       Util.isNullOrEmpty(justification) ) {
+      return true;
+    }
+    
+    // get application object, it should exist, as checked by the validation stage
+    Application application = context.getObjectByName(Application.class, appName);
+    List entitlementList = getEntitlements(appName, attributeName, entitlementValue);
+
+    // the IT role to update
+    Bundle optionalRole = null;
+    WorkflowCase pendingApprovalWFC = null;
+    
+    //new optional role 
+    boolean isCreateOptionalRole = false;
+
+    // retrieve the optional role
+    Bundle origOptRole = context.getObject(Bundle.class, optionalRoleName);
+    if(null == origOptRole &amp;&amp; action.equalsIgnoreCase("add")) {
+      // SQWIAM-1858: check if there is an existing pending role creation
+      QueryOptions qo = new QueryOptions();
+      qo.addFilter(Filter.like("name", "Approve Role: " + optionalRoleName, Filter.MatchMode.START));
+      List workFlowCases = context.getObjects(WorkflowCase.class, qo);
+      if(null != workFlowCases &amp;&amp; !workFlowCases.isEmpty()) {
+        pendingApprovalWFC = (WorkflowCase)workFlowCases.get(0);
+        logger.debug(lineCounter + ",pending approval workflow found (" + optionalRoleName + ") - " + pendingApprovalWFC.getId());
+        optionalRole = (Bundle)pendingApprovalWFC.getApprovalObject();
+      }
+      else {
+        optionalRole = createOptionalRole(optionalRoleName, roleOwnerName, application);
+        isCreateOptionalRole = true;
+        
+        if(!optionalRolesToNotify.containsKey(optionalRoleName) ) {
+          // the value would be role owner name and requestor name, seperated by '||'
+          String requestorName = "";
+          Identity requestorId = (Identity)context.getObjectByName(Identity.class, requestor);
+          if(null != requestorId) {
+            requestorName = requestorId.getDisplayName();
+            context.decache(requestorId);
+          }
+          
+          String v = roleOwnerName + "||" + requestorName;
+          optionalRolesToNotify.put(optionalRoleName, v);
+        }
+      }
+    }
+    else if(null == origOptRole &amp;&amp; action.equalsIgnoreCase("delete")) {
+      cntrEntitlementSkipped++;
+      
+      skipRptWriter.write(lineCounter + "," +
+        optionalRoleName + "," +
+        roleOwnerName + "," +
+        appName + "," + 
+        attributeName + "," + 
+        entitlementValue + "," + 
+        action + "," +
+        "\"Optional role '" + optionalRoleName + "' does not exist\"\n");
+      
+      logger.debug(lineCounter + ",Record skipped, optional role (" + optionalRoleName + ") does not exist, no deletion required");
+      
+      return false;
+    }
+    else if(null != origOptRole) {
+
+      pendingApprovalWFC = origOptRole.getPendingWorkflow();
+      if(null != pendingApprovalWFC) {
+        logger.debug(lineCounter + ",pending approval workflow found (" + optionalRoleName + ")");
+        optionalRole = (Bundle)pendingApprovalWFC.getApprovalObject();
+      }
+      else {
+        // Need to make a deep copy so any references will be clear
+        optionalRole = origOptRole.deepCopy(context);
+      }
+      
+      Identity owner = optionalRole.getOwner();
+      if(null != owner) {
+        roleOwnerName = owner.getName();
+      }
+      else {
+        roleOwnerName = "";
+      }
+    }
+    else {
+      // optional role doesn't exist, shouldn't occur here as checked by validation stage
+    }
+    
+    // check if there's a pending approval? If so, skip the record
+    if(null != pendingApprovalWFC &amp;&amp; !processedRoles.contains(optionalRoleName) ) {
+      cntrEntitlementSkipped++;
+      
+      // get the related work item ID
+      int wrkItmId = getWorkItemID(pendingApprovalWFC);
+      
+      skipRptWriter.write(lineCounter + "," +
+        optionalRoleName + "," +
+        roleOwnerName + "," + 
+        appName + "," + 
+        attributeName + "," + 
+        entitlementValue + "," + 
+        action + "," +
+        "\"There is a pending approval work item (ID: " + wrkItmId + ") for this optional Role\"\n");
+      logger.debug(lineCounter + ",Record skipped, there is a pending approval work item for this Optional Role (" + wrkItmId + ")");
+      
+      return false;
+    }
+    
+    if(!processedRoles.contains(optionalRoleName)) {
+      processedRoles.add(optionalRoleName);
+    }
+
+    boolean isEntitlementExist = isEntitlementExistInRole(origOptRole, appName, attributeName, entitlementList);
+
+    boolean isUpdateRequired = true;
+    if("add".equalsIgnoreCase(action)) {
+      // if entitlement already exist, no need to add again, skip
+      if(isEntitlementExist) {
+        isUpdateRequired = false;
+        cntrEntitlementSkipped++;
+        
+        // write to the skip report
+        skipRptWriter.write(lineCounter + "," +
+          optionalRoleName + "," +
+          roleOwnerName + "," + 
+          appName + "," + 
+          attributeName + "," + 
+          entitlementValue + "," + 
+          action + "," +
+          "\"Entitlement already exists\"\n");
+      }
+      else {
+        isUpdateRequired = addEntitlement(optionalRole, application, attributeName, entitlementList);
+        
+        // increment record counter
+        if(isUpdateRequired) {
+          cntrEntitlementAdded++;
+        }
+        else {
+          // we already checked the entitlement doesn't exist in current
+          // optional role, now it said update is not required, this implies there is a
+          // pending approval work item with such entitlement, hence skip.
+          cntrEntitlementSkipped++;
+          
+          // get the related work item ID
+          int workItemId = getWorkItemID(pendingApprovalWFC);
+
+          skipRptWriter.write(lineCounter + "," +
+            optionalRoleName + "," +
+            roleOwnerName + "," + 
+            appName + "," + 
+            attributeName + "," + 
+            entitlementValue + "," + 
+            action + "," +
+            "\"Entitlement already requested, pending for approval. Work Item ID: " + workItemId + "\"\n");
+        }
+      }
+    }
+    else if("delete".equalsIgnoreCase(action)){
+      // SQWIAM-2294: if entitlement does not exist, then skip.
+      if(!isEntitlementExist) {
+        isUpdateRequired = false;
+        cntrEntitlementSkipped++;
+        
+        String skipMsg = lineCounter + "," +
+            optionalRoleName + "," +
+            roleOwnerName + "," + 
+            appName + "," + 
+            attributeName + "," + 
+            entitlementValue + "," + 
+            action + "," +
+            "\"Entitlement is not present on the role\"\n";
+        skipRptWriter.write(skipMsg);
+      }
+      else {
+        isUpdateRequired = deleteEntitlement(optionalRole, appName, attributeName, entitlementList);
+        
+        // SQWIAM-1958: increment record counter
+        if(isUpdateRequired) {
+          cntrEntitlementDeleted++;
+        }
+        else {
+          // SQWIAM-1970: write to the skip report
+          // SQWIAM-2294: entitlement already checked it exists in the original
+          // IT role, now it doesn't required update, meaning there is a pending
+          // approval work item to delete such entitlement already.
+          // get the related work item ID
+          cntrEntitlementSkipped++;
+
+          int workItemId = getWorkItemID(pendingApprovalWFC);
+          
+          String skipMsg = lineCounter + "," +
+            optionalRoleName + "," +
+            roleOwnerName + "," + 
+            appName + "," + 
+            attributeName + "," + 
+            entitlementValue + "," + 
+            action + "," +
+            "\"Entitlement already requested, pending for approval. Work Item ID: " + workItemId + "\"\n";
+          skipRptWriter.write(skipMsg);
+        }
+      }
+    }
+
+    if(isUpdateRequired) {
+      // check if role approval has been configured, just in case.
+      String roleApprovalWFName = (String)Configuration.getSystemConfig().get("workflowRoleApproval");
+
+      logger.debug("approvalRequired: " + approvalRequired);
+      logger.debug("roleApprovalWFName: " + roleApprovalWFName);
+
+      // set business justification
+      // SQWIAM-1975: to cater for multiple updates on the same role, 
+      // a specific format is set to indicate the corresponding updates:
+      // &lt;requester name> &lt;action> entitlement "&lt;entitlement display name>" 
+      // for "&lt;application>" to this role with reason "&lt;business justification>"
+      String requestorName = null;
+      Identity requestorId = (Identity)context.getObjectByName(Identity.class, requestor);
+      if(null != requestorId) {
+        requestorName = requestorId.getDisplayName();
+        context.decache(requestorId);
+      }
+      
+      SimpleDateFormat dateFormatter = new SimpleDateFormat("dd/MM/yyyy-kk:mm:ss");
+      String dateToday = dateFormatter.format(timestamp);
+      String formattedBJ = "Requested By::" + requestorName + "::" + dateToday + "::" + justification;
+
+        // without approval, update the justification straight to the role
+        
+        // new IT role will be forced to get approval, hence
+        // when it comes to here, it's always update existing IT role.
+        
+        // create archive
+        if(null != origOptRole) {
+          BundleArchive roleArchive = createRoleArchive(origOptRole, requester);
+          context.saveObject(roleArchive);
+        }
+
+        logger.debug(lineCounter + ",optional role updated, no approval required (" + optionalRoleName + ")");
+        
+        
+        // no approval required, update role directly
+        // save the IT role after figuring out the old new differences for RoleChangeEvent object creation.
+        context.saveObject(optionalRole);
+
+        // create audit event for updates that aren't require approval
+        AuditEvent event = new AuditEvent(inputFilename, AuditEvent.ActionUpdateRole, optionalRoleName);
+        event.setApplication("Bulk Optional Role Updates");
+        event.setAccountName(requester);
+        event.setAttributeName(attributeName);
+        event.setAttributeValue(entitlementValue);
+        event.setAttribute("Optional Role", optionalRoleName);
+        event.setAttribute("Role Owner", roleOwnerName);
+        event.setAttribute("Application", appName);
+        event.setAttribute("Attribute", attributeName);
+        event.setAttribute("Entitlement", entitlementValue);
+        event.setAttribute("Action", action);
+        event.setAttribute("Requestor", requestor);
+        event.setAttribute("Approval Required", "N");
+        event.setAttribute("Business Justification", justification);
+        
+        Auditor.log(event);
+
+        context.commitTransaction();
+    }
+    else {
+      logger.debug(lineCounter + ",No update required (" + optionalRoleName + ")");
+    }
+    
+    // clean up
+    context.decache(application);
+    context.decache(optionalRole);
+
+    if(null != origOptRole) {
+      context.decache(origOptRole);
+    }
+
+    // SQWIAM-2274: return false to indicate the line was not empty
+    return false;
+  }
+  
+  
+  public void emailRoleOwnerForNewOptionalRoles() {
+    if(null == optionalRolesToNotify || optionalRolesToNotify.isEmpty()) {
+      return;
+    }
+    
+    // go through the list
+    for(Iterator itr=optionalRolesToNotify.keySet().iterator(); itr.hasNext(); ) {
+      String optionalRoleDisplayName = (String)itr.next();
+      String v = (String)optionalRolesToNotify.get(optionalRoleDisplayName);
+      if(null == v) {
+        continue;
+      }
+      
+      String[] roleOwnerAndRequestor = v.split("\\|\\|");
+      
+      // list email address to send
+      List emailAddrList = new ArrayList();
+      
+      // get the role owner and check for notification setting if it was a workgroup
+      Identity roleOwner = (Identity)context.getObjectByName(Identity.class, roleOwnerAndRequestor[0]);
+      if(null != roleOwner) {
+        if(roleOwner.isWorkgroup()) {
+          // is workgroup, check notification option
+          WorkgroupNotificationOption notifyOption = roleOwner.getNotificationOption();
+          if(null != notifyOption &amp;&amp; 
+             (notifyOption == WorkgroupNotificationOption.Both || notifyOption == WorkgroupNotificationOption.GroupEmailOnly)) {
+            // send to group email
+            String email = roleOwner.getEmail();
+            if(null != email &amp;&amp; !email.equals("")) {
+              emailAddrList.add(email);
+            }
+          }
+          
+          if(null != notifyOption &amp;&amp;
+             (notifyOption == WorkgroupNotificationOption.Both || notifyOption == WorkgroupNotificationOption.MembersOnly)) {
+            // send to members
+            // get a list of members
+            List members = getWorkgroupMembers(roleOwner.getName());
+            if(null != members &amp;&amp; !members.isEmpty()) {
+              // loop throught to get members' email 
+              for(String m : members) {
+                Identity mId = (Identity)context.getObjectByName(Identity.class, m);
+                if(null != mId) {
+                  String email = mId.getEmail();
+                  if(null != email &amp;&amp; !email.equals("")) {
+                    emailAddrList.add(email);
+                  }
+                  
+                  context.decache(mId);
+                }
+              }
+            }
+          }
+        }
+        else {
+          // owner is an identity
+          String email = roleOwner.getEmail();
+          if(null != email &amp;&amp; !email.equals("")) {
+            emailAddrList.add(email);
+          }
+        }
+        context.decache(roleOwner);
+        
+        // prepare the email
+        Map emailVars = new HashMap();
+        emailVars.put("optionalRoleDisplayName", optionalRoleDisplayName);
+        emailVars.put("requestorDisplayName", roleOwnerAndRequestor[1]);
+        
+        EmailOptions options = new EmailOptions(emailAddrList, null);
+        options.setVariables(emailVars);
+        
+        EmailTemplate et = context.getObjectByName(EmailTemplate.class, "Role Change Approval Work Item Notification - BRU Create IT Role Only");
+        context.sendEmailNotification(et, options);
+      }
+    }
+  }
+
+  public void emailProcessCompletion(String requester, String absInputFilename, String inputFilename, Date timestamp, 
+                                     String skipFileFullPath) {
+  
+    // get requester email address
+    String requesterEmailAddr = null;
+    String requesterDisplayName = null;
+    Identity ident = context.getObjectByName(Identity.class, requester);
+    if(null != ident) {
+      requesterEmailAddr = ident.getEmail();
+      requesterDisplayName = ident.getDisplayName();
+      context.decache(ident);
+    }
+    
+    if(null == requesterEmailAddr) {
+      String err = "Failed to send error notification, requester '" + requester + "' does not have email!";
+      Message msg = new Message(Message.Type.Error,err, new Object[] {});
+      wfcase.addMessage(msg);
+      wfcase.put("errorMessage",err);
+      return;
+    }
+
+    SimpleDateFormat dateFormatter = new SimpleDateFormat("dd/MM/yyyy");
+    SimpleDateFormat timeFormatter = new SimpleDateFormat("kk:mm:ss");
+    String dateToday = dateFormatter.format(timestamp);
+    String timeToday = timeFormatter.format(timestamp);
+    
+    // prepare the email
+    EmailOptions options = new EmailOptions(requesterEmailAddr, null);
+    
+    Map emailVars = new HashMap();
+    emailVars.put("identityDisplayName", requesterDisplayName);
+    emailVars.put("absInputFilename", absInputFilename);
+    emailVars.put("inputFilename", inputFilename);
+    emailVars.put("procDate", dateToday);
+    emailVars.put("procTime", timeToday);
+    
+    emailVars.put("cntrEntitlementAdded", cntrEntitlementAdded);
+    emailVars.put("cntrEntitlementDeleted", cntrEntitlementDeleted);
+    emailVars.put("cntrEntitlementSkipped", cntrEntitlementSkipped);
+    emailVars.put("cntrEntitlementProcessed", cntrEntitlementProcessed);
+    
+    options.setVariables(emailVars);
+    
+    // SQWIAM-1970: add skip file
+    String recordsSkippedText = "\n";
+    if(cntrEntitlementSkipped > 0) {
+      // add records skipped text
+      recordsSkippedText = "(see attached 'Records Skipped' file)\n";
+
+      // attach the csv file
+      File file = new File(skipFileFullPath);
+      byte[] bArray = new byte[(int)file.length()];
+      
+      FileInputStream fis = new FileInputStream(file);
+      fis.read(bArray);
+      fis.close();
+
+      // get the absolute error filename
+      String skipFilename = null;
+      if(skipFileFullPath.lastIndexOf("/") != -1) {
+        skipFilename = skipFileFullPath.substring(skipFileFullPath.lastIndexOf("/") + 1);
+      }    
+      else {
+        skipFilename = skipFileFullPath;
+      }
+      EmailFileAttachment attachment = new EmailFileAttachment(skipFilename, EmailFileAttachment.MimeType.MIME_CSV, bArray);
+      options.addAttachment(attachment);
+    }
+    emailVars.put("recordsSkippedText", recordsSkippedText);
+
+    EmailTemplate et = context.getObjectByName(EmailTemplate.class, "Bulk Optional Role Updates Completion Success");
+    context.sendEmailNotification(et, options);
+  }
+    
+  /*
+   * Main 
+   */
+  File inputFile = new File(inputFilename);
+  if ((!inputFile.exists()) || (inputFile.isDirectory())) {
+    String err = "File '" + inputFilename + "' does not exist!";
+    Message msg = new Message(Message.Type.Error,err, new Object[] {});
+    wfcase.addMessage(msg);
+    wfcase.put("errorMessage",err);
+    return;
+  }
+
+  File sortedFile = new File(sortedFilename);
+  if ((!sortedFile.exists()) || (sortedFile.isDirectory())) {
+    String err = "File '" + sortedFilename + "' does not exist!";
+    Message msg = new Message(Message.Type.Error,err, new Object[] {});
+    wfcase.addMessage(msg);
+    wfcase.put("errorMessage",err);
+    return;
+  }
+
+  int idx = inputFilename.lastIndexOf("/");
+  if(idx == -1) {
+    // try backslash, just in case.
+    idx = inputFilename.lastIndexOf("\\");
+  }
+  
+  if(idx == -1) {
+    String err = "Input file name cannot be determined";
+    logger.error(err);
+      
+    Message msg = new Message(Message.Type.Error, err, new Object[] {});
+    wfcase.addMessage(msg);
+    wfcase.put("errorMessage", err);
+    return;
+  }
+  
+  String fname = inputFilename.substring(idx + 1);
+  
+  Calendar rightNow = Calendar.getInstance();
+  SimpleDateFormat formatter = new SimpleDateFormat("yyyyMMddkkmmss");
+  Date dNow = rightNow.getTime();
+  String dateToday = formatter.format(dNow);
+
+  String fileDirectory = "%%BULK_OPTIONAL_ROLE_UPDATES_DEFAULT_FILE_PATH%%/RecordsSkippedReports";
+
+  File directory = new File(fileDirectory);
+  if (!directory.exists())
+  {
+    directory.mkdirs();
+  }
+
+  String skipFileName = fname + "_RecordsSkippedReport_" + dateToday + ".csv";
+  String skipFileFullPath = fileDirectory + "/" + skipFileName;
+  File skipRptFile = new File( skipFileFullPath );
+  
+  skipRptFile.createNewFile();
+  FileOutputStream skipFileOutputStream = new FileOutputStream(skipRptFile);
+  BufferedWriter skipRptWriter = new BufferedWriter ( new OutputStreamWriter (skipFileOutputStream ) );
+  skipRptWriter.write("Record Number,Optional Role,Role Owner,Application,Attribute,Entitlement,Action,Record Skipped Reason\n");
+  
+  
+  RFC4180LineParser parser = new RFC4180LineParser(",");
+  ArrayList errorList = new ArrayList();
+  ArrayList headerStrings = new ArrayList();
+  int lineCounter = 1;
+  String thisLine = null;
+
+  BufferedReader fileIn = new BufferedReader(new FileReader(sortedFilename));
+  while (null != (thisLine = fileIn.readLine())) {
+    if(!Util.isNotNullOrEmpty(thisLine)) {
+      lineCounter++;
+      continue;
+    }
+
+    List tokens = parser.parseLine(thisLine);
+    //logger.debug(" tokens: " + tokens);
+
+    if(lineCounter == 1) {
+      for (int i=0; i &lt; tokens.size(); i++) {
+        String column = tokens.get(i).trim().toLowerCase();
+        headerStrings.add(column);
+      }
+    }
+    else {
+      Map lineHash = new HashMap();
+
+      for (int i=0; i &lt; tokens.size(); i++) {
+        if(i >= headerStrings.size()) break;
+        
+        String headerString = headerStrings.get(i);
+        String valueString = tokens.get(i);
+        if (Util.isNotNullOrEmpty(valueString) ) {
+          valueString = valueString.trim();
+
+          //logger.debug("column: " + headerString + " val: " + valueString);
+          lineHash.put(headerString, valueString);
+        }
+      }
+
+      boolean isLineEmpty = processLineHash(lineHash, errorList, skipRptWriter, fname, dNow);
+      if(!isLineEmpty) {
+        cntrEntitlementProcessed++;
+      }
+    }
+
+    lineCounter++;
+  }
+
+  fileIn.close();
+  
+  skipRptWriter.flush();
+  skipRptWriter.close();
+  skipFileOutputStream.close();
+  
+
+  if(cntrEntitlementSkipped > 0) {
+    // sort the error file first
+    String tmpSkipFilename = "/tmp/" + fname + "_RecordsSkippedReport_" + dateToday + ".tmp";
+      
+    String sortSkipRpt = "(/usr/bin/head -n 1 " + skipFileFullPath 
+      + " &amp;&amp; /usr/bin/tail -n +2 " + skipFileFullPath
+      + " | /usr/bin/sort -t ',' -k1,1 -n) "  
+      + " > " + tmpSkipFilename + "\n"
+      + " cat " + tmpSkipFilename + " > " + skipFileFullPath + "\n"
+      + " rm " + tmpSkipFilename + "\n";
+    String[] sortCmd = {
+      "sh", "-c", sortSkipRpt
+    };
+    String err = executeCmd(sortCmd);  
+    if (null != err) {
+      String errMsg = "Error sorting skip report file (" + err + ")";
+      Message msg = new Message(Message.Type.Error, errMsg, new Object[] {});
+      wfcase.addMessage(msg);
+      wfcase.put("errorMessage",errMsg);
+    }
+  }
+    
+  emailProcessCompletion(requester, inputFilename, fname, dNow, skipFileFullPath);
+
+  // report any errors
+  if(!errorList.isEmpty()) {
+    for(int i=0; i &lt; errorList.size(); i++) {
+      String err = (String)errorList.get(i);
+      logger.error(err);
+
+      Message msg = new Message(Message.Type.Error, err, new Object[] {});
+      wfcase.addMessage(msg);
+
+      wfcase.put("errorMessage", err);
+    }
+  }
+  
+  if(cntrEntitlementSkipped == 0) {
+    skipRptFile.delete();
+  }
+  
+  
+  return;

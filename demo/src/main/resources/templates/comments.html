@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="ISO-8859-1" />
+<title>View Comments</title>
+</head>
+
+<body>
+	<div id="info">TODO: i18n</div>
+	<br />
+	<div>
+		<tr th:each="comment: ${comments}">
+			<div>
+				<label>Post ID: </label>
+				<td th:text="${comment.postId}" /> <br /> <label>Comment
+					ID: </label>
+				<td th:text="${comment.id}" /> <br /> <label>Name: </label>
+				<td th:text="${comment.name}" /> <br /> <label>Email: </label>
+				<td th:text="${comment.email}" /> <br /> <label>Body: </label>
+				<td th:text="${comment.body}" />
+			</div>
+			<br />
+		</tr>
+	</div>
+</body>
+</html>
