@@ -10,18 +10,18 @@
          $(document).ready(function(){
             $.getJSON("https://jsonplaceholder.typicode.com/posts", function(result){
                $.each(result, function(key, value) {
-            	  let post = "<div>";
-            	  post += "<label>User Id: " + value.userId + "</label>";
-            	  post += "<br/>";
-            	  post += "<label>Post Id: " + value.id + "</label>";
-            	  post += "<br/>";
-            	  post += "<label>Title: " + value.title + "</label>";
-            	  post += "<br/>";
-            	  post += "<label>Comment: " + value.body + "</label>";
-            	  post += "<br/>";
-            	  post += "<a href=\"/comments/" + value.id + "\">View Comments</a>";
-            	  post += "</div>";
-            	  post += "<br/>";
+                  let post = "<div>";
+                  post += "<label>User Id: " + value.userId + "</label>";
+                  post += "<br/>";
+                  post += "<label>Post Id: " + value.id + "</label>";
+                  post += "<br/>";
+                  post += "<label>Title: " + value.title + "</label>";
+                  post += "<br/>";
+                  post += "<label>Comment: " + value.body + "</label>";
+                  post += "<br/>";
+                  post += "<a href=\"/comments/" + value.id + "\">View Comments</a>";
+                  post += "</div>";
+                  post += "<br/>";
                   $("#postsJson").append(post);
                }); 
             });
@@ -29,9 +29,9 @@
       </script>
    </head>
 
-   
-
    <body>
+      <div>TODO: i18n</div>
+      <br/>
       <div id = "postsJson"> </div>
    </body>
 </html>
